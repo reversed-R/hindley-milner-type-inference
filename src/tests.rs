@@ -1,8 +1,8 @@
-use log::{debug, info};
+use log::debug;
 
 use crate::{
     ast::{Ast, CallExpr, Expr, LambdaExpr, Literal, Stmt, VarDecl, VarName},
-    infer::{FnTyp, Typ, TypEnv, init::ScopeId},
+    infer::{FnTy, Ty, infer_ast},
 };
 
 #[test]
@@ -36,41 +36,23 @@ fn test1() {
         ],
     };
 
-    info!("target syntax tree:");
-    ast.print();
-    debug!("----");
+    debug!("\n{ast}");
 
-    let env = TypEnv::new(ast).unwrap();
+    let res = infer_ast(&ast).unwrap();
 
-    let res = env.infer().unwrap();
+    debug!("\n{res}");
 
-    debug!("----");
-    info!("type inference succeeded!");
-    info!("results:");
-    res.print();
-
+    assert_eq!(res.tys.get(&VarName("x".to_string())), Some(&Ty::Int));
+    assert_eq!(res.tys.get(&VarName("y".to_string())), Some(&Ty::Int));
     assert_eq!(
-        res.variables
-            .get(&(VarName("f".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Fn(FnTyp {
-            args: vec![Typ::Int],
-            ret: Box::new(Typ::Int)
-        }))
-    );
-    assert_eq!(
-        res.variables
-            .get(&(VarName("x".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Int)
-    );
-    assert_eq!(
-        res.variables
-            .get(&(VarName("y".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Int)
-    );
-    assert_eq!(
-        res.variables
-            .get(&(VarName("x".to_string()), ScopeId::new(1, 0))),
-        Some(&Typ::Int)
+        Ok(()),
+        res.can_apply(
+            &VarName("f".to_string()),
+            FnTy {
+                args: vec![Ty::Int],
+                ret: Box::new(Ty::Int)
+            }
+        )
     );
 }
 
@@ -123,38 +105,33 @@ fn test2() {
         ],
     };
 
-    let env = TypEnv::new(ast).unwrap();
-    let res = env.infer().unwrap();
+    debug!("\n{ast}");
 
+    let res = infer_ast(&ast).unwrap();
+
+    debug!("\n{res}");
+
+    assert_eq!(res.tys.get(&VarName("x".to_string())), Some(&Ty::Float));
+    assert_eq!(res.tys.get(&VarName("y".to_string())), Some(&Ty::Float));
+    assert_eq!(res.tys.get(&VarName("z".to_string())), Some(&Ty::Float));
     assert_eq!(
-        res.variables
-            .get(&(VarName("f".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Fn(FnTyp {
-            args: vec![Typ::Float],
-            ret: Box::new(Typ::Float)
-        }))
+        Ok(()),
+        res.can_apply(
+            &VarName("f".to_string()),
+            FnTy {
+                args: vec![Ty::Float],
+                ret: Box::new(Ty::Float)
+            }
+        )
     );
     assert_eq!(
-        res.variables
-            .get(&(VarName("x".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Float)
-    );
-    assert_eq!(
-        res.variables
-            .get(&(VarName("y".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Float)
-    );
-    assert_eq!(
-        res.variables
-            .get(&(VarName("g".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Fn(FnTyp {
-            args: vec![Typ::Float, Typ::Float],
-            ret: Box::new(Typ::Float)
-        }))
-    );
-    assert_eq!(
-        res.variables
-            .get(&(VarName("z".to_string()), ScopeId::new(0, 0))),
-        Some(&Typ::Float)
+        Ok(()),
+        res.can_apply(
+            &VarName("g".to_string()),
+            FnTy {
+                args: vec![Ty::Float, Ty::Float],
+                ret: Box::new(Ty::Float)
+            }
+        )
     );
 }

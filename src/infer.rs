@@ -1,345 +1,307 @@
-use log::{debug, info};
-use rand::seq::IndexedRandom;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
 };
 
-pub(crate) mod init;
-mod term;
-mod union_find;
+use crate::ast::{Ast, Expr, Literal, Stmt, VarName};
 
-use crate::{
-    ast::VarName,
-    infer::{
-        init::{ScopeId, VariablePool},
-        term::{Term, TermLiteral, TypVar},
-        union_find::UnionFind,
-    },
-};
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TyVar(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Typ {
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ty {
+    Var(TyVar),
     Int,
     Float,
     Bool,
-    Fn(FnTyp), // Defined(String),
+    Fn(FnTy),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FnTyp {
-    pub(crate) args: Vec<Typ>,
-    pub(crate) ret: Box<Typ>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnTy {
+    pub(crate) args: Vec<Ty>,
+    pub(crate) ret: Box<Ty>,
 }
 
-/// TypEnv represents environment for type inference.
-///
-/// NOTE: `variables` do not means type variables but variables in the original language AST.
-#[derive(Debug)]
-pub struct TypEnv {
-    substitutions: HashMap<TypVar, Typ>,
-    constraints: HashMap<TypVar, Term>,
-    variables: VariablePool,
-    unifications: HashMap<TypVar, TypVar>,
-}
-
+// scheme means type scheme
+// this realizes generics (parametric polymorphism)
 #[derive(Debug, Clone)]
-pub enum TypeError {
+pub struct Scheme {
+    vars: Vec<TyVar>,
+    typ: Ty,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TyEnv {
+    map: HashMap<VarName, Scheme>,
+}
+
+#[derive(Debug)]
+pub struct Infer {
+    next_tv: usize,
+    substitutions: HashMap<TyVar, Ty>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TyError {
     VariableNotFound(VarName),
     VariableConflicted(VarName),
 
-    TypeVariableNotCallable(TypVar),
-    FnArgLenMismatched(TypVar, TypVar),
-    TypeConfliced(TypVar, Typ, Typ),
+    TypeVariableNotCallable(TyVar),
+    FnArgLenMismatched(FnTy, FnTy),
+    TypeConfliced(Ty, Ty),
+    OccursCheckFailed(TyVar, Ty),
+}
+
+type TyResult<T> = Result<T, TyError>;
+
+impl Infer {
+    pub fn new() -> Self {
+        Self {
+            next_tv: 0,
+            substitutions: HashMap::new(),
+        }
+    }
+
+    fn fresh(&mut self) -> Ty {
+        let v = TyVar(self.next_tv);
+        self.next_tv += 1;
+        Ty::Var(v)
+    }
+
+    fn apply(&self, t: Ty) -> Ty {
+        match t {
+            Ty::Var(v) => {
+                if let Some(t2) = self.substitutions.get(&v) {
+                    self.apply(t2.clone())
+                } else {
+                    Ty::Var(v)
+                }
+            }
+            Ty::Fn(f) => Ty::Fn(FnTy {
+                args: f.args.into_iter().map(|a| self.apply(a)).collect(),
+                ret: Box::new(self.apply(*f.ret)),
+            }),
+            x => x,
+        }
+    }
+
+    fn unify(&mut self, t1: Ty, t2: Ty) -> TyResult<()> {
+        let t1 = self.apply(t1);
+        let t2 = self.apply(t2);
+
+        // FIXME: inefficient clone to return Err
+        match (t1.clone(), t2.clone()) {
+            (Ty::Var(v), t) | (t, Ty::Var(v)) => {
+                let t = self.apply(t);
+                if t == Ty::Var(v.clone()) {
+                    Ok(())
+                } else if occurs(&v, &t) {
+                    Err(TyError::OccursCheckFailed(v, t))
+                } else {
+                    self.substitutions.insert(v, t);
+
+                    Ok(())
+                }
+            }
+            (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Bool, Ty::Bool) => Ok(()),
+
+            (Ty::Fn(f1), Ty::Fn(f2)) => {
+                if f1.args.len() != f2.args.len() {
+                    Err(TyError::FnArgLenMismatched(f1, f2))
+                } else {
+                    for (a1, a2) in f1.args.into_iter().zip(f2.args.into_iter()) {
+                        self.unify(a1, a2)?;
+                    }
+
+                    self.unify(*f1.ret, *f2.ret)?;
+
+                    Ok(())
+                }
+            }
+            _ => Err(TyError::TypeConfliced(t1, t2)),
+        }
+    }
+
+    fn ftv(t: &Ty) -> HashSet<TyVar> {
+        match t {
+            Ty::Var(v) => [v.clone()].into(),
+            Ty::Fn(f) => {
+                let mut s = HashSet::new();
+                for a in &f.args {
+                    s.extend(Self::ftv(a));
+                }
+                s.extend(Self::ftv(&f.ret));
+                s
+            }
+            _ => HashSet::new(),
+        }
+    }
+
+    fn ftv_scheme(s: &Scheme) -> HashSet<TyVar> {
+        let mut ftv = Self::ftv(&s.typ);
+        for v in &s.vars {
+            ftv.remove(v);
+        }
+        ftv
+    }
+
+    fn ftv_env(env: &TyEnv) -> HashSet<TyVar> {
+        env.map.values().flat_map(Self::ftv_scheme).collect()
+    }
+
+    fn generalize(&self, env: &TyEnv, t: Ty) -> Scheme {
+        let ftv_t = Self::ftv(&t);
+        let ftv_env = Self::ftv_env(env);
+
+        let vars = ftv_t.difference(&ftv_env).cloned().collect::<Vec<_>>();
+
+        Scheme { vars, typ: t }
+    }
+
+    fn instantiate(&mut self, s: &Scheme) -> Ty {
+        let mut m = HashMap::new();
+
+        for v in &s.vars {
+            m.insert(v.clone(), self.fresh());
+        }
+
+        fn go(t: &Ty, m: &HashMap<TyVar, Ty>) -> Ty {
+            match t {
+                Ty::Var(v) => m.get(v).cloned().unwrap_or(Ty::Var(v.clone())),
+                Ty::Fn(f) => Ty::Fn(FnTy {
+                    args: f.args.iter().map(|a| go(a, m)).collect(),
+                    ret: Box::new(go(&f.ret, m)),
+                }),
+                x => x.clone(),
+            }
+        }
+
+        go(&s.typ, &m)
+    }
+
+    fn infer_expr(&mut self, env: &mut TyEnv, expr: &Expr) -> TyResult<Ty> {
+        match expr {
+            Expr::Literal(Literal::Integer(_)) => Ok(Ty::Int),
+            Expr::Literal(Literal::Float(_)) => Ok(Ty::Float),
+            Expr::Literal(Literal::Bool(_)) => Ok(Ty::Bool),
+
+            Expr::Variable(v) => {
+                let scheme = env.map.get(v).expect("unbound variable");
+                Ok(self.instantiate(scheme))
+            }
+
+            Expr::Lambda(l) => {
+                let mut local_env = env.clone();
+
+                let args: Vec<Ty> = l
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let tv = self.fresh();
+                        local_env.map.insert(
+                            a.clone(),
+                            Scheme {
+                                vars: vec![],
+                                typ: tv.clone(),
+                            },
+                        );
+                        tv
+                    })
+                    .collect();
+
+                let body = self.infer_expr(&mut local_env, &l.ret)?;
+
+                Ok(Ty::Fn(FnTy {
+                    args,
+                    ret: Box::new(body),
+                }))
+            }
+
+            Expr::Call(c) => {
+                let f = self.infer_expr(env, &Expr::Variable(c.f.clone()))?;
+                let args = c
+                    .args
+                    .iter()
+                    .map(|a| self.infer_expr(env, a))
+                    .collect::<Result<_, _>>()?;
+
+                let ret = self.fresh();
+                self.unify(
+                    f,
+                    Ty::Fn(FnTy {
+                        args,
+                        ret: Box::new(ret.clone()),
+                    }),
+                )?;
+
+                Ok(ret)
+            }
+        }
+    }
+}
+
+fn occurs(v: &TyVar, t: &Ty) -> bool {
+    match t {
+        Ty::Var(v2) => v == v2,
+        Ty::Fn(f) => f.args.iter().any(|a| occurs(v, a)) || occurs(v, &f.ret),
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
-pub struct InferedTypes {
-    pub(crate) variables: HashMap<(VarName, ScopeId), Typ>,
+pub struct InferedTys {
+    pub schemes: HashMap<VarName, Scheme>,
+    pub tys: HashMap<VarName, Ty>,
 }
 
-impl TypEnv {
-    pub fn infer(mut self) -> Result<InferedTypes, TypeError> {
-        let mut rng = rand::rng();
+pub fn infer_ast(ast: &Ast) -> TyResult<InferedTys> {
+    let mut infer = Infer::new();
+    let mut env = TyEnv::default();
+    let mut tys = HashMap::new();
 
-        // randでランダムにconstraintsを取得している
-        // が、それって本当?という感がある。
-        while let Some(&&t) = self.constraints.keys().collect::<Vec<_>>().choose(&mut rng) {
-            let c = self.constraints.get(&t).unwrap().clone();
-            debug!("{t} == {c}");
-
-            match c {
-                Term::Eq(e) => {
-                    // 等価な2つの型変数はunifiyし、
-                    // 制約を取り除いた状態にする
-                    self.unify(&[(e.t1, e.t2)]);
-                    self.constraints.remove(&t);
-                }
-                Term::Var(v) => {
-                    // Varの参照する型変数vについて型変数tと同一でないならば
-                    //   型変数tをvでunifyし、
-                    //   Varを取り除いた状態にする
-                    if t != v {
-                        self.unify(&[(t, v)]);
-                        self.constraints.remove(&t);
-                    }
-                }
-                Term::Fn(f) => {
-                    // Fnの引数や戻り値の型変数が
-                    // - すべてsubstitutionを持っているならば
-                    //   - substituteする
-                    // - そうでないならば、constraintsに含んだままにする
-                    let mut all_substituted = true;
-                    for a in &f.args {
-                        if let Some(typ) = self.get_substitution(a) {
-                            self.substitute(*a, typ.clone())?;
-                        } else {
-                            all_substituted = false;
-                        }
-                    }
-                    if let Some(typ) = self.get_substitution(&f.ret) {
-                        self.substitute(f.ret, typ.clone())?;
-                    } else {
-                        all_substituted = false;
-                    }
-
-                    if all_substituted {
-                        let args = f
-                            .args
-                            .iter()
-                            .map(|a| self.get_substitution(a).cloned())
-                            .collect::<Option<Vec<_>>>()
-                            .unwrap();
-                        let ret = self.get_substitution(&f.ret).unwrap();
-                        self.substitute(
-                            t,
-                            Typ::Fn(FnTyp {
-                                args,
-                                ret: Box::new(ret.clone()),
-                            }),
-                        )?;
-                    }
-                }
-                Term::Apply(app) => {
-                    // Applyの関数fを取得し、
-                    // 関数であり、引数の長さが一致していることを確認
-                    // ApplyとFnの引数の型変数の対応でunifiy
-                    if let Some(term) = self.constraints.get(&app.f) {
-                        match term {
-                            Term::Fn(f) => {
-                                if f.args.len() != app.args.len() {
-                                    return Err(TypeError::FnArgLenMismatched(t, app.f));
-                                } else {
-                                    let reps = f
-                                        .args
-                                        .iter()
-                                        .zip(app.args.iter())
-                                        .map(|(x, y)| (*x, *y))
-                                        .collect::<Vec<_>>();
-
-                                    self.unify(&reps);
-
-                                    // 引数の型変数にsubstitutionがあればしておく
-                                    for a in &app.args {
-                                        if let Some(typ) = self.get_substitution(a) {
-                                            self.substitute(t, typ.clone())?;
-                                        }
-                                    }
-                                }
-                            }
-                            Term::Eq(_) | Term::Var(_) | Term::Apply(_) => {
-                                // nothing to do
-                            }
-                            Term::Literal(_) => {
-                                return Err(TypeError::TypeVariableNotCallable(app.f));
-                            }
-                        }
-                    } else if let Some(Typ::Fn(f)) = self.get_substitution(&app.f).cloned() {
-                        // fがsubstitutionを持っている場合、
-                        // 引数の型変数はfの引数の型変数の型でそれぞれsubstitutionされ、
-                        // App全体の型変数はfの戻り値の型変数の型でsubstitutionされる
-                        if f.args.len() != app.args.len() {
-                            return Err(TypeError::FnArgLenMismatched(t, app.f));
-                        } else {
-                            for (t, typ) in app.args.iter().zip(f.args.iter()) {
-                                self.substitute(*t, typ.clone())?;
-                            }
-
-                            self.substitute(t, *f.ret)?;
-                        }
-                    } else {
-                        // NOTE: TypEnvの初期化時に変数の存在チェックはしているため、
-                        // ただのNoneになることはない。
-                        // つまり、ここに来るのはTermがFn以外だったときのみ。
-                        return Err(TypeError::TypeVariableNotCallable(app.f));
-                    }
-                }
-                Term::Literal(l) => match l {
-                    // 簡単のためリテラルは直ちに型が付くとする
-                    TermLiteral::Integer(_) => {
-                        // 本当はIntegerはIntかUintかLongかくらいの推論はさせたい
-                        self.substitute(t, Typ::Int)?;
-                    }
-                    TermLiteral::Float(_) => {
-                        self.substitute(t, Typ::Float)?;
-                    }
-                    TermLiteral::Bool(_) => {
-                        self.substitute(t, Typ::Bool)?;
-                    }
-                },
+    for stmt in &ast.stmts {
+        match stmt {
+            Stmt::VarDecl(v) => {
+                let t = infer.infer_expr(&mut env, &v.val)?;
+                let t = infer.apply(t);
+                let scheme = infer.generalize(&env, t.clone());
+                env.map.insert(v.name.clone(), scheme);
+                tys.insert(v.name.clone(), t);
             }
-        }
-
-        let mut variables = HashMap::new();
-        for (sid, vars) in &self.variables.scopes {
-            for (v, t) in vars {
-                variables.insert(
-                    (v.clone(), sid.clone()),
-                    self.get_substitution(t).unwrap().clone(),
-                );
-            }
-        }
-
-        Ok(InferedTypes { variables })
-    }
-
-    // 制約の集合constraintsのうち、
-    // 型変数oldから型変数newへの置換の組
-    // (old: TypVar, new: TypVar)
-    // の列 reps によって
-    // 複数の型変数を一括でunifyする
-    fn unify(&mut self, reps: &[(TypVar, TypVar)]) {
-        debug!(
-            "unifiy: [{}]",
-            reps.iter()
-                .filter(|(old, new)| old != new)
-                .map(|(old, new)| format!("{old} => {new}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-
-        // 置換の組の列 reps から
-        // 置換のHashMap norm(normalizer)を計算
-        let norm = self.build_normalizer(reps);
-
-        if norm.is_empty() {
-            return;
-        }
-
-        for c in self.constraints.values_mut() {
-            match c {
-                Term::Fn(f) => {
-                    for a in f.args.iter_mut() {
-                        if let Some(new) = norm.get(a) {
-                            *a = *new;
-                        }
-                    }
-
-                    if let Some(new) = norm.get(&f.ret) {
-                        f.ret = *new;
-                    }
-                }
-                Term::Apply(app) => {
-                    if let Some(new) = norm.get(&app.f) {
-                        app.f = *new;
-                    }
-
-                    for a in app.args.iter_mut() {
-                        if let Some(new) = norm.get(a) {
-                            *a = *new;
-                        }
-                    }
-                }
-                Term::Eq(e) => {
-                    if let Some(new) = norm.get(&e.t1) {
-                        e.t1 = *new;
-                    }
-                    if let Some(new) = norm.get(&e.t2) {
-                        e.t2 = *new;
-                    }
-                }
-                Term::Var(v) => {
-                    if let Some(new) = norm.get(v) {
-                        *v = *new;
-                    }
-                }
-                Term::Literal(_) => {}
-            }
-        }
-
-        // 型変数dstが型変数srcにunifyされたことを記録
-        // 最後に結果を復元する際に使用
-        self.unifications = norm;
-    }
-
-    fn substitute(&mut self, tv: TypVar, typ: Typ) -> Result<(), TypeError> {
-        // constraintsから除去し、
-        // substitutionsに追加する
-        self.constraints.remove(&tv);
-        if let Some(existence_typ) = self.substitutions.get(&tv) {
-            if &typ != existence_typ {
-                Err(TypeError::TypeConfliced(tv, existence_typ.clone(), typ))
-            } else {
-                Ok(())
-            }
-        } else {
-            debug!("substitute: {tv} = {typ}");
-            self.substitutions.insert(tv, typ);
-
-            Ok(())
         }
     }
 
-    // reps: (old: TypVar, new: TypVar) の置換の組の集まり
-    fn build_normalizer(&mut self, reps: &[(TypVar, TypVar)]) -> HashMap<TypVar, TypVar> {
-        let mut uf = UnionFind::new();
+    Ok(InferedTys {
+        schemes: env.map,
+        tys,
+    })
+}
 
-        // すべて union
-        for (x, y) in &self.unifications {
-            uf.union(*x, *y);
-        }
-        for &(old, new) in reps {
-            uf.union(old, new);
-        }
+impl InferedTys {
+    // for test
+    pub fn can_apply(&self, var: &VarName, f: FnTy) -> TyResult<()> {
+        let mut infer = Infer::new();
+        let f_scheme = self
+            .schemes
+            .get(var)
+            .ok_or(TyError::VariableNotFound(var.clone()))?;
 
-        // 登場するすべての 型変数 を集める
-        let mut ts = HashSet::new();
-        for (x, y) in &self.unifications {
-            ts.insert(*x);
-            ts.insert(*y);
-        }
-        for &(old, new) in reps {
-            ts.insert(old);
-            ts.insert(new);
-        }
-
-        // 各 TypVar -> 代表 TypVar
-        let mut normalizer = HashMap::new();
-        for t in ts {
-            let root = uf.find(t);
-            normalizer.insert(t, root);
-        }
-
-        normalizer
-    }
-
-    fn get_substitution(&self, t: &TypVar) -> Option<&Typ> {
-        self.substitutions
-            .get(self.unifications.get(t).unwrap_or(t))
+        let t = infer.instantiate(f_scheme);
+        infer.unify(t.clone(), Ty::Fn(f))
     }
 }
 
-impl InferedTypes {
-    pub fn print(&self) {
-        for ((v, sid), typ) in &self.variables {
-            info!("{v} ({sid}): {typ}");
-        }
+impl Display for TyVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "t{}", self.0)
     }
 }
 
-impl Display for Typ {
+impl Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Var(v) => write!(f, "{v}"),
             Self::Int => write!(f, "Int"),
             Self::Float => write!(f, "Float"),
             Self::Bool => write!(f, "Bool"),
@@ -348,7 +310,7 @@ impl Display for Typ {
     }
 }
 
-impl Display for FnTyp {
+impl Display for FnTy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -358,7 +320,31 @@ impl Display for FnTyp {
                 .map(|a| a.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            self.ret
+            *self.ret
         )
+    }
+}
+
+impl Display for Scheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for v in &self.vars {
+            write!(f, "∀{v}")?;
+        }
+
+        if !self.vars.is_empty() {
+            write!(f, ". ")?;
+        }
+
+        write!(f, "{}", self.typ)
+    }
+}
+
+impl Display for InferedTys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (v, s) in &self.schemes {
+            writeln!(f, "{v}: {s}")?;
+        }
+
+        Ok(())
     }
 }

@@ -41,12 +41,6 @@ pub(crate) struct CallExpr {
     pub(crate) args: Vec<Expr>,
 }
 
-impl Ast {
-    pub(crate) fn print(&self) {
-        info!("{self}");
-    }
-}
-
 impl Display for Ast {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for stmt in &self.stmts {
