@@ -150,15 +150,6 @@ impl Infer {
         env.map.values().flat_map(Self::ftv_scheme).collect()
     }
 
-    fn generalize(&self, env: &TyEnv, t: Ty) -> Scheme {
-        let ftv_t = Self::ftv(&t);
-        let ftv_env = Self::ftv_env(env);
-
-        let vars = ftv_t.difference(&ftv_env).cloned().collect::<Vec<_>>();
-
-        Scheme { vars, typ: t }
-    }
-
     fn instantiate(&mut self, s: &Scheme) -> Ty {
         let mut m = HashMap::new();
 
@@ -265,8 +256,13 @@ pub fn infer_ast(ast: &Ast) -> TyResult<InferedTys> {
             Stmt::VarDecl(v) => {
                 let t = infer.infer_expr(&mut env, &v.val)?;
                 let t = infer.apply(t);
-                let scheme = infer.generalize(&env, t.clone());
-                env.map.insert(v.name.clone(), scheme);
+                env.map.insert(
+                    v.name.clone(),
+                    Scheme {
+                        vars: vec![], // 単一の型を割り当てるため、量化しない
+                        typ: t.clone(),
+                    },
+                );
                 tys.insert(v.name.clone(), t);
             }
         }
