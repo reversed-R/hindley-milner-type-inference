@@ -1,39 +1,26 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
+use std::{collections::HashMap, fmt::Display};
+
+mod builder;
+pub(crate) mod types;
+
+use crate::{
+    ast::{AbsId, Ast, Callee, Expr, Literal, MemberName, MethodName, Stmt, VarName},
+    infer::{
+        builder::TyBuilder,
+        types::{
+            FnId, FnTy, Scheme, SymId, Ty, TyConstr, TyVar,
+            struct_type::{StructId, StructTy},
+        },
+    },
 };
 
-use crate::ast::{Ast, Expr, Literal, Stmt, VarName};
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TyVar(pub usize);
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Ty {
-    Var(TyVar),
-    Int,
-    Float,
-    Bool,
-    Fn(FnTy),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FnTy {
-    pub(crate) args: Vec<Ty>,
-    pub(crate) ret: Box<Ty>,
-}
-
-// scheme means type scheme
-// this realizes generics (parametric polymorphism)
 #[derive(Debug, Clone)]
-pub struct Scheme {
-    vars: Vec<TyVar>,
-    typ: Ty,
-}
-
-#[derive(Debug, Default, Clone)]
 pub struct TyEnv {
-    map: HashMap<VarName, Scheme>,
+    schemes: HashMap<VarName, Scheme>,
+    structs: HashMap<StructId, StructTy>,
+    fns: HashMap<FnId, FnTy>,
+    syms: HashMap<AbsId, SymId>,
+    method_impls: HashMap<Ty, HashMap<MethodName, FnTy>>,
 }
 
 #[derive(Debug)]
@@ -47,10 +34,16 @@ pub enum TyError {
     VariableNotFound(VarName),
     VariableConflicted(VarName),
 
+    SymbolNotFound(AbsId),
+    StructMemberConfliced(AbsId, MemberName),
+    SymbolNotAType(AbsId),
+
     TypeVariableNotCallable(TyVar),
     FnArgLenMismatched(FnTy, FnTy),
     TypeConfliced(Ty, Ty),
     OccursCheckFailed(TyVar, Ty),
+    MemberNotFound(Ty, MemberName),
+    MethodNotImpled(Ty, MethodName),
 }
 
 type TyResult<T> = Result<T, TyError>;
@@ -66,16 +59,16 @@ impl Infer {
     fn fresh(&mut self) -> Ty {
         let v = TyVar(self.next_tv);
         self.next_tv += 1;
-        Ty::Var(v)
+        Ty::Var(v, vec![])
     }
 
     fn apply(&self, t: Ty) -> Ty {
         match t {
-            Ty::Var(v) => {
+            Ty::Var(v, c) => {
                 if let Some(t2) = self.substitutions.get(&v) {
                     self.apply(t2.clone())
                 } else {
-                    Ty::Var(v)
+                    Ty::Var(v, c)
                 }
             }
             Ty::Fn(f) => Ty::Fn(FnTy {
@@ -92,9 +85,10 @@ impl Infer {
 
         // FIXME: inefficient clone to return Err
         match (t1.clone(), t2.clone()) {
-            (Ty::Var(v), t) | (t, Ty::Var(v)) => {
+            (Ty::Var(v, c), t) | (t, Ty::Var(v, c)) => {
                 let t = self.apply(t);
-                if t == Ty::Var(v.clone()) {
+                if t == Ty::Var(v.clone(), c.clone()) {
+                    // TODO: constraintsも含んで正しく等価計算をする関数を定義
                     Ok(())
                 } else if occurs(&v, &t) {
                     Err(TyError::OccursCheckFailed(v, t))
@@ -123,32 +117,32 @@ impl Infer {
         }
     }
 
-    fn ftv(t: &Ty) -> HashSet<TyVar> {
-        match t {
-            Ty::Var(v) => [v.clone()].into(),
-            Ty::Fn(f) => {
-                let mut s = HashSet::new();
-                for a in &f.args {
-                    s.extend(Self::ftv(a));
-                }
-                s.extend(Self::ftv(&f.ret));
-                s
-            }
-            _ => HashSet::new(),
-        }
-    }
-
-    fn ftv_scheme(s: &Scheme) -> HashSet<TyVar> {
-        let mut ftv = Self::ftv(&s.typ);
-        for v in &s.vars {
-            ftv.remove(v);
-        }
-        ftv
-    }
-
-    fn ftv_env(env: &TyEnv) -> HashSet<TyVar> {
-        env.map.values().flat_map(Self::ftv_scheme).collect()
-    }
+    // fn ftv(t: &Ty) -> HashSet<TyVar> {
+    //     match t {
+    //         Ty::Var(v) => [v.clone()].into(),
+    //         Ty::Fn(f) => {
+    //             let mut s = HashSet::new();
+    //             for a in &f.args {
+    //                 s.extend(Self::ftv(a));
+    //             }
+    //             s.extend(Self::ftv(&f.ret));
+    //             s
+    //         }
+    //         _ => HashSet::new(),
+    //     }
+    // }
+    //
+    // fn ftv_scheme(s: &Scheme) -> HashSet<TyVar> {
+    //     let mut ftv = Self::ftv(&s.typ);
+    //     for v in &s.vars {
+    //         ftv.remove(v);
+    //     }
+    //     ftv
+    // }
+    //
+    // fn ftv_env(env: &TyEnv) -> HashSet<TyVar> {
+    //     env.schemes.values().flat_map(Self::ftv_scheme).collect()
+    // }
 
     fn instantiate(&mut self, s: &Scheme) -> Ty {
         let mut m = HashMap::new();
@@ -159,7 +153,8 @@ impl Infer {
 
         fn go(t: &Ty, m: &HashMap<TyVar, Ty>) -> Ty {
             match t {
-                Ty::Var(v) => m.get(v).cloned().unwrap_or(Ty::Var(v.clone())),
+                // WARN: really?
+                Ty::Var(v, _) => m.get(v).cloned().unwrap_or(Ty::Var(v.clone(), vec![])),
                 Ty::Fn(f) => Ty::Fn(FnTy {
                     args: f.args.iter().map(|a| go(a, m)).collect(),
                     ret: Box::new(go(&f.ret, m)),
@@ -178,7 +173,10 @@ impl Infer {
             Expr::Literal(Literal::Bool(_)) => Ok(Ty::Bool),
 
             Expr::Variable(v) => {
-                let scheme = env.map.get(v).expect("unbound variable");
+                let scheme = env
+                    .schemes
+                    .get(v)
+                    .ok_or(TyError::VariableNotFound(v.clone()))?;
                 Ok(self.instantiate(scheme))
             }
 
@@ -190,7 +188,7 @@ impl Infer {
                     .iter()
                     .map(|a| {
                         let tv = self.fresh();
-                        local_env.map.insert(
+                        local_env.schemes.insert(
                             a.clone(),
                             Scheme {
                                 vars: vec![],
@@ -209,24 +207,134 @@ impl Infer {
                 }))
             }
 
-            Expr::Call(c) => {
-                let f = self.infer_expr(env, &Expr::Variable(c.f.clone()))?;
-                let args = c
-                    .args
-                    .iter()
-                    .map(|a| self.infer_expr(env, a))
-                    .collect::<Result<_, _>>()?;
+            Expr::Call(c) => match &c.f {
+                Callee::Fn(id) => {
+                    let f = if let Some(SymId::Fn(id)) = env.syms.get(id) {
+                        env.fns.get(id).expect("not found").clone()
+                    } else {
+                        return Err(TyError::SymbolNotFound(id.clone()));
+                    };
+                    let callee_ret = (*f.ret).clone();
 
-                let ret = self.fresh();
-                self.unify(
-                    f,
-                    Ty::Fn(FnTy {
-                        args,
-                        ret: Box::new(ret.clone()),
-                    }),
-                )?;
+                    let args = c
+                        .args
+                        .iter()
+                        .map(|a| self.infer_expr(env, a))
+                        .collect::<Result<_, _>>()?;
+                    let ret = self.fresh();
 
-                Ok(ret)
+                    self.unify(
+                        Ty::Fn(f),
+                        Ty::Fn(FnTy {
+                            args,
+                            ret: Box::new(ret),
+                        }),
+                    )?;
+
+                    Ok(callee_ret)
+                }
+                Callee::Var(v) => {
+                    let f = self.infer_expr(env, &Expr::Variable(v.clone()))?;
+
+                    let args = c
+                        .args
+                        .iter()
+                        .map(|a| self.infer_expr(env, a))
+                        .collect::<Result<_, _>>()?;
+
+                    let ret = self.fresh();
+                    self.unify(
+                        f,
+                        Ty::Fn(FnTy {
+                            args,
+                            ret: Box::new(ret.clone()),
+                        }),
+                    )?;
+
+                    Ok(ret)
+                }
+            },
+
+            Expr::MemberAccess(m) => {
+                let left = self.infer_expr(env, &m.left)?;
+
+                match left.clone() {
+                    Ty::Int | Ty::Float | Ty::Bool | Ty::Fn(_) => {
+                        Err(TyError::MemberNotFound(left, m.member.clone()))
+                    }
+                    Ty::Var(v, mut c) => {
+                        // // TODO: memberを持つという制約を追加
+                        // // cはどこに行く????
+                        // c.push(TyConstr::HasMember(m.member.clone().into()));
+                        //
+                        // Ok(self.fresh())
+
+                        todo!()
+                    }
+                    Ty::Struct(s) => env
+                        .structs
+                        .get(&s)
+                        .unwrap()
+                        .members
+                        .get(&m.member.clone().into())
+                        .ok_or(TyError::MemberNotFound(left, m.member.clone()))
+                        .cloned(),
+                }
+            }
+
+            Expr::MethodCall(m) => {
+                // TODO:
+                // method 名からargs, retのTyと,
+                // (実装しているTyの集合 || 満たしているtraitの集合)
+                // を引けるようにデータを持っておく
+                // leftのTyから直ちに引けるならそれでもいい
+
+                // NOTE:
+                // m に含まれるmethodを実装しているTyは1つではないのが問題
+                // SchemeにもたせるconstraintsにTyのorとかtraitのorとかを持たせられる必要がある
+                // leftに記録する
+
+                let left = self.infer_expr(env, &m.left)?;
+                match left.clone() {
+                    Ty::Var(v, mut c) => {
+                        // TODO: methodを持つという制約を追加
+                        // cはどこに行く????
+                        // c.push(TyConstr::HasMember(m.member.clone().into()));
+                        //
+                        // Ok(self.fresh())
+
+                        todo!()
+                    }
+                    // NOTE: leftの具体の型が判明するならmethodをimplしているかどうか判定できる
+                    Ty::Int | Ty::Float | Ty::Bool | Ty::Fn(_) | Ty::Struct(_) => {
+                        let f = env
+                            .method_impls
+                            .get(&left)
+                            .unwrap()
+                            .get(&m.method)
+                            .ok_or(TyError::MethodNotImpled(left, m.method.clone()))
+                            .cloned()?;
+
+                        let args = m
+                            .args
+                            .iter()
+                            .map(|a| self.infer_expr(env, a))
+                            .collect::<Result<_, _>>()?;
+
+                        let ret = (*f.ret).clone();
+
+                        let tv = self.fresh();
+                        self.unify(
+                            Ty::Fn(f),
+                            Ty::Fn(FnTy {
+                                args,
+                                ret: Box::new(tv),
+                            }),
+                        )?;
+
+                        Ok(ret)
+                    }
+                }
             }
         }
     }
@@ -234,7 +342,7 @@ impl Infer {
 
 fn occurs(v: &TyVar, t: &Ty) -> bool {
     match t {
-        Ty::Var(v2) => v == v2,
+        Ty::Var(v2, _) => v == v2,
         Ty::Fn(f) => f.args.iter().any(|a| occurs(v, a)) || occurs(v, &f.ret),
         _ => false,
     }
@@ -248,7 +356,7 @@ pub struct InferedTys {
 
 pub fn infer_ast(ast: &Ast) -> TyResult<InferedTys> {
     let mut infer = Infer::new();
-    let mut env = TyEnv::default();
+    let mut env = TyEnv::new(ast)?;
     let mut tys = HashMap::new();
 
     for stmt in &ast.stmts {
@@ -256,7 +364,7 @@ pub fn infer_ast(ast: &Ast) -> TyResult<InferedTys> {
             Stmt::VarDecl(v) => {
                 let t = infer.infer_expr(&mut env, &v.val)?;
                 let t = infer.apply(t);
-                env.map.insert(
+                env.schemes.insert(
                     v.name.clone(),
                     Scheme {
                         vars: vec![], // 単一の型を割り当てるため、量化しない
@@ -269,9 +377,31 @@ pub fn infer_ast(ast: &Ast) -> TyResult<InferedTys> {
     }
 
     Ok(InferedTys {
-        schemes: env.map,
+        schemes: env.schemes,
         tys,
     })
+}
+
+impl TyEnv {
+    fn new(ast: &Ast) -> TyResult<Self> {
+        let mut builder = TyBuilder::new(ast);
+
+        for (id, s) in &ast.structs {
+            builder.build_and_store_struct_ty(id.clone(), s.clone())?;
+        }
+
+        for (id, f) in &ast.fns {
+            builder.build_and_store_fn_ty(id.clone(), f.clone())?;
+        }
+
+        Ok(Self {
+            schemes: HashMap::new(),
+            structs: builder.structs,
+            fns: builder.fns,
+            syms: builder.syms,
+            method_impls: HashMap::new(),
+        })
+    }
 }
 
 impl InferedTys {
@@ -297,11 +427,12 @@ impl Display for TyVar {
 impl Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Var(v) => write!(f, "{v}"),
+            Self::Var(v, _) => write!(f, "{v}"),
             Self::Int => write!(f, "Int"),
             Self::Float => write!(f, "Float"),
             Self::Bool => write!(f, "Bool"),
             Self::Fn(func) => write!(f, "{func}"),
+            Self::Struct(id) => write!(f, "struct {id}"),
         }
     }
 }
