@@ -8,7 +8,7 @@ use crate::{
     infer::{
         builder::TyBuilder,
         types::{
-            FnId, FnTy, Scheme, SymId, Ty, TyConstr, TyVar,
+            FnId, FnTy, Scheme, SymId, Ty, TyVar,
             struct_type::{StructId, StructTy},
         },
     },
@@ -36,6 +36,7 @@ pub enum TyError {
 
     SymbolNotFound(AbsId),
     StructMemberConfliced(AbsId, MemberName),
+    MethodConfliced(Ty, MethodName),
     SymbolNotAType(AbsId),
 
     TypeVariableNotCallable(TyVar),
@@ -44,6 +45,7 @@ pub enum TyError {
     OccursCheckFailed(TyVar, Ty),
     MemberNotFound(Ty, MemberName),
     MethodNotImpled(Ty, MethodName),
+    InsufficientContext,
 }
 
 type TyResult<T> = Result<T, TyError>;
@@ -262,15 +264,7 @@ impl Infer {
                     Ty::Int | Ty::Float | Ty::Bool | Ty::Fn(_) => {
                         Err(TyError::MemberNotFound(left, m.member.clone()))
                     }
-                    Ty::Var(v, mut c) => {
-                        // // TODO: memberを持つという制約を追加
-                        // // cはどこに行く????
-                        // c.push(TyConstr::HasMember(m.member.clone().into()));
-                        //
-                        // Ok(self.fresh())
-
-                        todo!()
-                    }
+                    Ty::Var(_, _) => Err(TyError::InsufficientContext),
                     Ty::Struct(s) => env
                         .structs
                         .get(&s)
@@ -283,28 +277,10 @@ impl Infer {
             }
 
             Expr::MethodCall(m) => {
-                // TODO:
-                // method 名からargs, retのTyと,
-                // (実装しているTyの集合 || 満たしているtraitの集合)
-                // を引けるようにデータを持っておく
-                // leftのTyから直ちに引けるならそれでもいい
-
-                // NOTE:
-                // m に含まれるmethodを実装しているTyは1つではないのが問題
-                // SchemeにもたせるconstraintsにTyのorとかtraitのorとかを持たせられる必要がある
-                // leftに記録する
-
                 let left = self.infer_expr(env, &m.left)?;
-                match left.clone() {
-                    Ty::Var(v, mut c) => {
-                        // TODO: methodを持つという制約を追加
-                        // cはどこに行く????
-                        // c.push(TyConstr::HasMember(m.member.clone().into()));
-                        //
-                        // Ok(self.fresh())
 
-                        todo!()
-                    }
+                match left.clone() {
+                    Ty::Var(_, _) => Err(TyError::InsufficientContext),
                     // NOTE: leftの具体の型が判明するならmethodをimplしているかどうか判定できる
                     Ty::Int | Ty::Float | Ty::Bool | Ty::Fn(_) | Ty::Struct(_) => {
                         let f = env
@@ -394,12 +370,18 @@ impl TyEnv {
             builder.build_and_store_fn_ty(id.clone(), f.clone())?;
         }
 
+        for (typ, methods) in &ast.method_impls {
+            for (method, ftyp) in methods {
+                builder.build_and_store_method(typ.clone(), method.clone(), ftyp.clone())?;
+            }
+        }
+
         Ok(Self {
             schemes: HashMap::new(),
             structs: builder.structs,
             fns: builder.fns,
             syms: builder.syms,
-            method_impls: HashMap::new(),
+            method_impls: builder.method_impls,
         })
     }
 }

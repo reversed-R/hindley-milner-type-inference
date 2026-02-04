@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use crate::{
     ast::{
-        AbsId, Ast,
+        AbsId, Ast, MethodName,
         types::{FnType, StructType, Type},
     },
     infer::{
@@ -21,6 +21,7 @@ pub(super) struct TyBuilder<'ast> {
     pub(super) syms: HashMap<AbsId, SymId>,
     pub(super) structs: HashMap<StructId, StructTy>,
     pub(super) fns: HashMap<FnId, FnTy>,
+    pub(super) method_impls: HashMap<Ty, HashMap<MethodName, FnTy>>,
 }
 
 impl<'ast> TyBuilder<'ast> {
@@ -32,6 +33,7 @@ impl<'ast> TyBuilder<'ast> {
             syms: HashMap::new(),
             structs: HashMap::new(),
             fns: HashMap::new(),
+            method_impls: HashMap::new(),
         }
     }
 
@@ -119,5 +121,28 @@ impl<'ast> TyBuilder<'ast> {
         self.structs.insert(sid, sty);
 
         Ok(())
+    }
+
+    pub(crate) fn build_and_store_method(
+        &mut self,
+        typ: Type,
+        method: MethodName,
+        ftyp: FnType,
+    ) -> TyResult<()> {
+        // TODO:
+        let ty = self.build_ty(typ)?;
+        let fty = self.build_fn_ty(ftyp)?;
+        if let Some(methods) = self.method_impls.get_mut(&ty) {
+            match methods.entry(method.clone()) {
+                Entry::Occupied(_) => Err(TyError::MethodConfliced(ty, method)),
+                Entry::Vacant(e) => {
+                    e.insert(fty);
+                    Ok(())
+                }
+            }
+        } else {
+            self.method_impls.insert(ty, [(method, fty)].into());
+            Ok(())
+        }
     }
 }

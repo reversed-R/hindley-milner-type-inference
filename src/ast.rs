@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::ast::types::{FnType, StructType};
+use crate::ast::types::{FnType, StructType, Type};
 
 pub(crate) mod types;
 
@@ -8,6 +8,7 @@ pub(crate) struct Ast {
     pub(crate) fns: Vec<(AbsId, FnType)>,
     pub(crate) structs: Vec<(AbsId, StructType)>,
     pub(crate) stmts: Vec<Stmt>,
+    pub(crate) method_impls: Vec<(Type, Vec<(MethodName, FnType)>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,6 +91,14 @@ impl Display for Ast {
 
         for (id, fntyp) in &self.fns {
             writeln!(f, "fn {id}{fntyp} {{ ... }}")?;
+        }
+
+        for (typ, methods) in &self.method_impls {
+            writeln!(f, "impl {typ} {{")?;
+            for (method, ftyp) in methods {
+                writeln!(f, "fn {method}{ftyp} {{ ... }}")?;
+            }
+            writeln!(f, "}}")?;
         }
 
         writeln!(f)?;
@@ -216,5 +225,11 @@ impl Display for MethodCallExpr {
                 .collect::<Vec<_>>()
                 .join(","),
         )
+    }
+}
+
+impl Display for MethodName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }

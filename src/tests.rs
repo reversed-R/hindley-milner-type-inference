@@ -5,12 +5,12 @@ use log::debug;
 use crate::{
     ast::{
         AbsId, Ast, CallExpr, Callee, Expr, LambdaExpr, Literal, MemberAccessExpr, MemberName,
-        Stmt, VarDecl, VarName,
+        MethodCallExpr, MethodName, Stmt, VarDecl, VarName,
         types::{FnType, StructType, Type},
     },
     infer::{
         infer_ast,
-        types::{FnTy, Ty},
+        types::{FnTy, Ty, struct_type::StructId},
     },
 };
 
@@ -35,6 +35,7 @@ fn test1() {
     let ast = Ast {
         structs: vec![],
         fns: vec![],
+        method_impls: vec![],
         stmts: vec![
             Stmt::VarDecl(VarDecl {
                 name: VarName("f".to_string()),
@@ -90,6 +91,7 @@ fn test2() {
     let ast = Ast {
         structs: vec![],
         fns: vec![],
+        method_impls: vec![],
         stmts: vec![
             Stmt::VarDecl(VarDecl {
                 name: VarName("f".to_string()),
@@ -176,9 +178,14 @@ fn test3() {
     //   }
     // }
     //
+    // impl {
+    //   fn m0(self, Bool) -> Float { ... }
+    // }
+    //
     // let f = (x) -> x;
-    // let x = s_new().m;
-    // let y = f(x);
+    // let x = s_new();
+    // let y = f(x.n);
+    // let z = x.m0(y);
     // ```
     let ast = Ast {
         structs: vec![(
@@ -197,6 +204,16 @@ fn test3() {
                 ret: Box::new(Type::Defined(AbsId::new(vec![], "S".to_string()))),
             },
         )],
+        method_impls: vec![(
+            Type::Defined(AbsId::new(vec![], "S".to_string())),
+            vec![(
+                MethodName("m0".to_string()),
+                FnType {
+                    args: vec![Type::Bool],
+                    ret: Box::new(Type::Float),
+                },
+            )],
+        )],
         stmts: vec![
             Stmt::VarDecl(VarDecl {
                 name: VarName("f".to_string()),
@@ -207,19 +224,27 @@ fn test3() {
             }),
             Stmt::VarDecl(VarDecl {
                 name: VarName("x".to_string()),
-                val: Expr::MemberAccess(MemberAccessExpr {
-                    left: Box::new(Expr::Call(CallExpr {
-                        f: Callee::Fn(AbsId::new(vec![], "s_new".to_string())),
-                        args: vec![],
-                    })),
-                    member: MemberName("n".to_string()),
+                val: Expr::Call(CallExpr {
+                    f: Callee::Fn(AbsId::new(vec![], "s_new".to_string())),
+                    args: vec![],
                 }),
             }),
             Stmt::VarDecl(VarDecl {
                 name: VarName("y".to_string()),
                 val: Expr::Call(CallExpr {
                     f: Callee::Var(VarName("f".to_string())),
-                    args: vec![Expr::Variable(VarName("x".to_string()))],
+                    args: vec![Expr::MemberAccess(MemberAccessExpr {
+                        left: Box::new(Expr::Variable(VarName("x".to_string()))),
+                        member: MemberName("n".to_string()),
+                    })],
+                }),
+            }),
+            Stmt::VarDecl(VarDecl {
+                name: VarName("z".to_string()),
+                val: Expr::MethodCall(MethodCallExpr {
+                    left: Box::new(Expr::Variable(VarName("x".to_string()))),
+                    method: MethodName("m0".to_string()),
+                    args: vec![Expr::Variable(VarName("y".to_string()))],
                 }),
             }),
         ],
@@ -231,7 +256,10 @@ fn test3() {
 
     debug!("\n{res}");
 
-    assert_eq!(res.tys.get(&VarName("x".to_string())), Some(&Ty::Bool));
+    assert_eq!(
+        res.tys.get(&VarName("x".to_string())),
+        Some(&Ty::Struct(StructId::new(0)))
+    );
     assert_eq!(res.tys.get(&VarName("y".to_string())), Some(&Ty::Bool));
     assert_eq!(
         Ok(()),
@@ -243,4 +271,5 @@ fn test3() {
             }
         )
     );
+    assert_eq!(res.tys.get(&VarName("z".to_string())), Some(&Ty::Float));
 }
